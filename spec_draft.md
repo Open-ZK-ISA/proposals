@@ -154,6 +154,10 @@ Bit rearrangement operation: `rearrange(iN1, ..., iNk) -> (iM1, ..., iMl)` where
 
 In particular, this simulates `zext` and unsigned truncation.
 
+### Bitwise operations
+
+Standard bitwise operations on `iN` are provided.
+
 #### Pointer arithmetic
 
 Pointer elements can be constructed from `iN`, and back (returns value in `[0..PTR_ORDER]`, fails if it does not fit in `iN`).
