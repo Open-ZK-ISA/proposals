@@ -1,89 +1,161 @@
-### Types & parameters
+## SNARK-friendly abstract machine
 
-#### Primitive types
+In this text, we will describe a SNARK-friendly abstract machine.
 
-`iN`. A type representing element of $\mathbb{Z}/2^N \mathbb{Z}$.
+### Objectives
 
-*Note: this type faithfully simulates iN type from LLVM. Optionally, we can apply stronger restrictions on N than LLVM, but this is likely unnecessary.*
+1. SNARK-friendliness, including our best guess about future proof systems.
+2. Relatively easy compilation from high-level languages.
+3. Absence of UB (special form of attributable local non-determinism is allowed, see further).
+4. Code is to be either interpreted directly, or almost trivially compiled to lower-level bytecode of a specific backend.
 
-`ptr`. Pointer type. Represents integers in some range `[0..ptr::MAX]`. Attempt of creating pointer out of this range fails instantly (rather than in case of dereference).
+### Parametrization and types
 
-*Note: this behavior is necessary to allow backends to use native field type for dereference, without specifying it on ISA level.*
+Our machine will be parametrized over:
 
-`F_N`. Field types: collection of fields. Each field type has a canonical binary representation.
+1. Base field `F`. The main field of the proof system. It also has a specified canonical bit encoding.
+2. Pointer group - cyclic group, having order `PTR_ORDER`. *Note: typically, it will coincide with* `F`*, but over very small field a subgroup of multiplicative group is frequently chosen*. The size of the pointer in field elements is `PTR_WIDTH` (pointers, in theory, also might carry additional information).
+3. `LIMB_BITSIZE` - canonical integers will be split into limbs of this bitsize.
 
-### Abstract machine
+It also depends on few more parameters (bounds on program size, for example), which we leave for further clarification.
 
-Before describing the program structure, we first specify the state of the machine; but it is important to mention few things about how it operates, first:
+We have some primitive types. They all have "canonical forms", that is, fixed representations as tuples of k elements of `F`. Type system compliance is required on the level of the code to ensure absence of undefined behavior; i.e. forming an incorrect encoding of a primitive type using operations described below is impossible.
 
-1. It has a concept of a function call, and, therefore, a call stack.
-2. The format of the data on the call stack is known at all times.
+Following primitive types are supported:
 
-#### Stack / registers
+1. Base field `F`.
+2. Pointer type `ptr`: represented as `[F; PTR_WIDTH]`
+3. Integer types `iN`: represented as `[F; div_ceil(iN, LIMB_BITSIZE)]`
 
-zk ISA machine's callstack is a list of frames.
+Optional extension of the system with additional fields not described here.
 
-`Callstack : List<Frame>`
+### Program structure overview
 
-Each frame is just an infinite unstructured collection of typed registers.
+The structure of the program code:
 
-*Note: importantly, it is impossible to create a pointer to the data living on a stack. This seems to be necessary, because otherwise the stack structure would need to be specified. It is an acceptable tradeoff: pointer dereference leads to a RAM operation in any known proof system backend anyway.*
+1. Program is a collection of functions that may call eachother.
+2. Each function is a collection of basic blocks.
+3. Blocks contain instructions that operate on non-addressable frame, branching instructions and operations for interactions with RAM.
 
-#### Memory
+#### Frame
 
-A collection of memory spaces (each of size `ptr::MAX`) is specified: at least one for a primitive byte type `i8`, and for each of the supported fields.
+Each function performs transformations over a "stack frame" belonging to this particular function. We call it's elements registers. It has few functional differences to the normal stack.
 
-Optionally, separate memory spaces for larger `iN`'s can be specified for more efficient vectorized stores / loads.
+First, and most important difference is that it is not addressable by pointers. All the operations that can access the stack frame only operate in terms of static offsets.
 
-#### Hints
+*Note: this behavior can be simulated by normal architectures by giving different address spaces to stack and heap.*
 
-*TODO, unclear: do we have unconstrained memory? (makes fault attribution much harder). It is possibly a good choice to limit hints to pure functions (though it is ugly).*
+Second difference is calling convention, which largely resembles LLVM / MLIR (function can write it's outputs to any registers).
 
-*other option is to allow everything, but ban everything untrusted in deterministic contexts.*
+Elements of the frame are denoted `%0, %1, ...`. Additionally, we maintain another set of elements, `?1, ?2, ...`, which are called "shadow" and are unconstrained by verifier. They represent local non-deterministic advice.
 
-#### Program structure
+#### Deterministic mode
 
-*TODO: Program consists of functions, each function consists of basic blocks. All of this is completely parallel to LLVM-IR, with important change being that we might not insist on SSA form of the basic block (though I think it is desirable).*
+In a deterministic mode, shadow registers are constrained as well (and assertions work differently, as described further).
 
-### Operations
+#### Constants
 
-All operations except of branching take as inputs and outputs the registers in the current stack frame.
+Instructions can take a constant any time they can take a register element of a corresponding type. Some instructions also specifically require constants, these are written in `<>` brackets before the call body.
+
+#### Question: SSA or not?
+
+Currently, we assume that all registers are mutable and can be assigned to any amount of times. Program validator, however, does require that *all* assignments to a single register have the same type.
+
+However, it does not seem to be a problem to also require SSA form, which would also remove this requirement.
+
+No scoping is assumed inside of a function - any instruction can access any register.
+
+#### Function signature
+
+Function definition header is an expression of the form
+```
+define @func_name(T_0, ..., T_{k-1}; H_0, ..., H_{l-1}) -> (T'_0, ..., T'_{k'-1}; H'_0, ..., H'_{l'-1}) {
+    ...
+}
+```
+
+Where `T_i, H_i, T'_i, H'_i` are primitive type descriptors. Note two differences with LLVM-IR syntax: the variables are unnamed, and multiple outputs are allowed.
+
+The function application syntax is:
+
+```
+(%a'_0, ..., %a'_{k'-1}; ?b'_0, ..., ?b'_{l'-1}) = call @func_name (%a_0, ..., %a_{k-1}; ?b_0, ..., ?b_{l-1})
+```
+
+The values `%a_0, ... %a_{k-1}; ?b'_0, ..., ?b'_{l-1}` are passed to first `0..k; 0..l` values in a stack frame of the function.
+
+#### Function body
+
+Body is a collection of basic blocks. Each basic block contains sequence of instructions of few kinds:
+
+1. Branching instructions. Each block has a single branching instruction in the end, which are direct equivalents of LLVM's `br`, `switch`  and `return` instructions.
+2. Elementary operations, as defined further.
+3. `store` / `load` instructions.
+4. Calls.
+5. External calls (to be specified).
+
+#### RAM interaction instructions
+
+Following instructions are provided.
+
+1. `store<const OFFSET>(ptr, F) -> ()` : stores value in `ptr + OFFSET` memory cell.
+2. `load<const OFFSET>(ptr) -> F` : loads value from `ptr + OFFSET`
+
+`store` instruction can not be applied to shadow register, and load can, and also can write to shadow registers. Essentially, that means that non-deterministic data never hits memory.
+
+Static offsets are provided to enable simpler vectorization, if available, and to make simulation on stack machine backend easier.
 
 #### Casts
 
-1. `cast: iN -> iM` (modular reduction if M < N, append 0-s if M > N)
-2. `cast: F <-> i_{F::N_BITS}` (inverse operation validates bit repr)
-3. `cast_lax: iN -> F` (treats iN as unsigned, performs modular reduction if necessary)
-4. `cast: iN <-> ptr` (if `2**N > ptr::MAX`, validates the conversion as prescribed by definition of `ptr`)
-5. *TODO / q: casts between iN and [iK; M], likely should be allowed at least for byte repr, but maybe we can support a bit more?*
+In order to store / load an element, it must be canonicalized. I.e., there are casts
 
-#### Arithmetic
+`ptr -> [F; PTR_WIDTH]`
 
-1. `add, mul, sub, neg` are available for all ring types (i.e. iN and fields). Division is available for fields, and `sdiv` and `udiv` are available for `iN`'s. Division by zero fails.
+`iN -> [F; div_ceil(N, LIMB_BITSZE)]`
 
-2. `offset: (ptr, iN) -> ptr` is available. According to `ptr` requirement, out of bounds pointer produced by this operation should lead to program failure immediately and not on dereference. *Note: sometimes, backend might be able to get away with cheaper argument than rangecheck here.*
+These casts never fail. Reverse casts do fail if encoding is incorrect.
 
-3. `shl, shr, and, or, xor` are available for `iN`.
+#### Assertions and exception handling
 
-4. `cmp` is available for all types.
+Two assertion instructions are provided: `assert_zero(F) -> ()` and `assert_nonzero(F) -> ()`.
 
-#### RAM interactions
+*(Here be dragons):*
 
-1. `load<T, addrspace>: ptr -> T`
-2. `store<T, addrspace>: (ptr, T) -> ()`
+In a deterministic mode, all assertions (and other fail conditions) allow the prover to output `trap` value from the program.
 
-#### External calls
+In particular, to prove the failure (of a program known to be deterministic, or of a particular execution of non-deterministic program), it is enough for the prover to rewind a single block and execute it in a deterministic mode.
 
-*TODO: even if there is no precompiles, we will need them to at least interact with storage through non-deterministic hints.*
+Similar approach can be used for other exception-handling, for example, out-of-gas errors.
 
-#### Branching
+#### Field arithmetic
 
-*TODO: specify semantics exactly*
+Following instructions are provided:
 
-1. Calls / returns.
-2. Unconditional jump (`br`)
-3. Conditional jump (`br`)
-4. Switch (`switch`)
-5. Phi node (`phi`), if we go SSA route (which I think is indeed justified).
+1. `add(F, F) -> F`
+2. `mul(F, F) -> F`
+3. `neg(F) -> F`
+4. `sub(F) -> F`
+5. `inv(F) -> F` (fallible)
+6. `div(F, F) -> F` (fallible)
 
-static jumps by pointer are not possible, as incorrect pointer is an undefined behavior (despite LLVM having them, but these can be pretty easily simulated using switch anyway)
+#### Integer arithmetic
+
+For `iN`, ring arithmetic in $\mathbb{Z}/2^N\mathbb{Z}$ operations are provided, together with `udiv`, `sdiv`, `shl` and `shr`.
+
+Additionally, signed and unsigned integer arithmetic primitives are provided. They all have the name `(i/u)(add/sub/neg/mul/div/mod)z`, and work as follows:
+
+Given integer inputs, attempt to perform the operation, and output the result in output `iN`, or *fail if output does not fit*.
+
+*Note: non-wrapping operations can be compiled to this form.*
+
+*Note: it might make sense to also support unbounded integer on the level of a dialect, which will be given provable upper bound in the instantiation.*
+
+Bit rearrangement operation: `rearrange(iN1, ..., iNk) -> (iM1, ..., iMl)` where the sum `N1 + ... + Nk = M1 + ... + Ml`.
+
+In particular, this simulates `zext` and unsigned truncation.
+
+#### Pointer arithmetic
+
+Pointer elements can be constructed from `iN`, and back (returns value in `[0..PTR_ORDER]`, fails if it does not fit in `iN`).
+
+Pointer elements can be added, but not multiplied.
